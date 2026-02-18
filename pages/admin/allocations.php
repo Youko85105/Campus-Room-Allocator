@@ -13,6 +13,35 @@ $user = getCurrentUser();
 $error = '';
 $success = '';
 
+// ===== AJAX: fetch student's latest pending allocation request =====
+if (isset($_GET['ajax']) && $_GET['ajax'] === 'student_request') {
+    header('Content-Type: application/json; charset=utf-8');
+
+    $sid = isset($_GET['student_id']) ? (int)$_GET['student_id'] : 0;
+    if ($sid <= 0) {
+        echo json_encode(['ok' => false, 'message' => 'Invalid student_id']);
+        exit;
+    }
+
+    try {
+        $req = fetchOne(
+            "SELECT request_id, user_id, preferred_building, preferred_floor, roommate_preference, special_needs,
+                    request_status, admin_response, created_at
+             FROM allocation_requests
+             WHERE user_id = ? AND request_status = 'pending'
+             ORDER BY created_at DESC
+             LIMIT 1",
+            [$sid]
+        );
+
+        echo json_encode(['ok' => true, 'request' => $req]);
+        exit;
+    } catch (Exception $e) {
+        echo json_encode(['ok' => false, 'message' => $e->getMessage()]);
+        exit;
+    }
+}
+
 // Handle new allocation
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['allocate'])) {
     $student_id = (int)$_POST['student_id'];
@@ -53,11 +82,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['allocate'])) {
                 executeQuery("UPDATE rooms SET current_occupancy = current_occupancy + 1 WHERE room_id = ?", [$room_id]);
                 
                 // Update room status if full
-                if (($room['current_occupancy'] + 1) >= $room['capacity']) {
-                    executeQuery("UPDATE rooms SET status = 'full' WHERE room_id = ?", [$room_id]);
-                }
-                
-                commit();
+if (($room['current_occupancy'] + 1) >= $room['capacity']) {
+    executeQuery("UPDATE rooms SET status = 'full' WHERE room_id = ?", [$room_id]);
+}
+
+// ✅ Auto-approve the student's latest pending request (if exists)
+$pendingReq = fetchOne(
+    "SELECT request_id
+     FROM allocation_requests
+     WHERE user_id = ? AND request_status = 'pending'
+     ORDER BY created_at DESC
+     LIMIT 1",
+    [$student_id]
+);
+
+if ($pendingReq) {
+    executeQuery(
+        "UPDATE allocation_requests
+         SET request_status = 'approved',
+             admin_response = ?
+         WHERE request_id = ?",
+        ["Approved. Room allocated (Room ID: {$room_id})", (int)$pendingReq['request_id']]
+    );
+}
+
+commit();
+
                 
                 $success = 'Room allocated successfully!';
                 
@@ -401,7 +451,7 @@ $pendingCheckout = count(array_filter($allocations, fn($a) => $a['status'] === '
                     <div class="modal-body">
                         <div class="mb-3">
                             <label class="form-label">Student *</label>
-                            <select class="form-select" name="student_id" id="studentSelect" required onchange="updateRecommendedRooms()">
+                            <select class="form-select" name="student_id" id="studentSelect" required onchange="updateRecommendedRooms(); loadStudentRequest();">
                                 <option value="">Select Student</option>
                                 <?php foreach ($unallocatedStudents as $student): ?>
                                     <option value="<?php echo $student['user_id']; ?>" data-year="<?php echo $student['year_level']; ?>">
@@ -410,6 +460,53 @@ $pendingCheckout = count(array_filter($allocations, fn($a) => $a['status'] === '
                                 <?php endforeach; ?>
                             </select>
                         </div>
+
+                        <!-- ✅ Student Request Details (shows after selecting a student) -->
+<div id="studentRequestCard" class="card border-0 shadow-sm mb-3" style="display:none;">
+  <div class="card-header bg-light">
+    <strong><i class="fas fa-file-alt"></i> Student Room Request</strong>
+    <span id="reqStatusBadge" class="badge bg-warning text-dark ms-2">Pending</span>
+  </div>
+  <div class="card-body">
+    <div id="studentRequestLoading" class="text-muted" style="display:none;">
+      <i class="fas fa-spinner fa-spin"></i> Loading request...
+    </div>
+
+    <div id="studentRequestEmpty" class="text-muted" style="display:none;">
+      No pending room request submitted by this student.
+    </div>
+
+    <div id="studentRequestDetails" style="display:none;">
+      <div class="row g-2">
+        <div class="col-md-6">
+          <div class="small text-muted">Preferred Building</div>
+          <div id="reqBuilding" class="fw-semibold">-</div>
+        </div>
+        <div class="col-md-6">
+          <div class="small text-muted">Preferred Floor</div>
+          <div id="reqFloor" class="fw-semibold">-</div>
+        </div>
+        <div class="col-md-6 mt-2">
+          <div class="small text-muted">Roommate Preference</div>
+          <div id="reqRoommate" class="fw-semibold">-</div>
+        </div>
+        <div class="col-md-6 mt-2">
+          <div class="small text-muted">Special Needs</div>
+          <div id="reqNeeds" class="fw-semibold">-</div>
+        </div>
+        <div class="col-md-12 mt-2">
+          <div class="small text-muted">Submitted At</div>
+          <div id="reqCreated" class="fw-semibold">-</div>
+        </div>
+        <div class="col-md-12 mt-2">
+          <div class="small text-muted">Admin Response</div>
+          <div id="reqResponse" class="fw-semibold">-</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
                         
                         <div class="mb-3">
                             <label class="form-label">Available Room *</label>
@@ -520,6 +617,75 @@ $pendingCheckout = count(array_filter($allocations, fn($a) => $a['status'] === '
                 }
             }
         }
+
+        async function loadStudentRequest() {
+    const studentSelect = document.getElementById('studentSelect');
+    const studentId = studentSelect.value;
+
+    const card = document.getElementById('studentRequestCard');
+    const loading = document.getElementById('studentRequestLoading');
+    const empty = document.getElementById('studentRequestEmpty');
+    const details = document.getElementById('studentRequestDetails');
+
+    // Reset UI
+    if (!studentId) {
+        card.style.display = 'none';
+        return;
+    }
+
+    card.style.display = 'block';
+    loading.style.display = 'block';
+    empty.style.display = 'none';
+    details.style.display = 'none';
+
+    try {
+        const res = await fetch(`allocations.php?ajax=student_request&student_id=${encodeURIComponent(studentId)}`);
+        const data = await res.json();
+
+        loading.style.display = 'none';
+
+        if (!data.ok) {
+            empty.style.display = 'block';
+            empty.textContent = data.message || 'Failed to load request.';
+            return;
+        }
+
+        const req = data.request;
+
+        if (!req) {
+            empty.style.display = 'block';
+            empty.textContent = 'No pending room request submitted by this student.';
+            return;
+        }
+
+        // Fill fields
+        const statusBadge = document.getElementById('reqStatusBadge');
+        const status = (req.request_status || 'pending').toLowerCase();
+
+        statusBadge.textContent = status.charAt(0).toUpperCase() + status.slice(1);
+
+        // badge color
+        statusBadge.className = 'badge ms-2 ' + (
+            status === 'approved' ? 'bg-success' :
+            status === 'rejected' ? 'bg-danger' :
+            'bg-warning text-dark'
+        );
+
+        document.getElementById('reqBuilding').textContent = req.preferred_building || 'Any';
+        document.getElementById('reqFloor').textContent = (req.preferred_floor !== null && req.preferred_floor !== undefined && req.preferred_floor !== '') ? req.preferred_floor : 'Any';
+        document.getElementById('reqRoommate').textContent = req.roommate_preference || '-';
+        document.getElementById('reqNeeds').textContent = req.special_needs || '-';
+        document.getElementById('reqCreated').textContent = req.created_at || '-';
+        document.getElementById('reqResponse').textContent = req.admin_response || '-';
+
+        details.style.display = 'block';
+    } catch (e) {
+        loading.style.display = 'none';
+        empty.style.display = 'block';
+        empty.textContent = 'Error loading request.';
+    }
+}
+
     </script>
 </body>
 </html>
